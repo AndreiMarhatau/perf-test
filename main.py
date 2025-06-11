@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """
 PC Performance Test Suite
 Tests CPU single-core performance and drive I/O performance

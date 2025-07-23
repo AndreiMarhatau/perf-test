@@ -22,65 +22,51 @@ class PerformanceTest:
         except:
             pass
     
-    def cpu_single_core_test(self):
-        """Test CPU single-core performance using mathematical calculations"""
+    def cpu_single_core_test(self, duration=10):
+        """Test CPU single-core performance for a fixed duration"""
         print("🔥 Testing CPU Single-Core Performance...")
-        
-        # Prime number calculation test
-        def is_prime(n):
+
+        def is_prime(n: int) -> bool:
+            """Check if a number is prime"""
             if n < 2:
                 return False
             for i in range(2, int(math.sqrt(n)) + 1):
                 if n % i == 0:
                     return False
             return True
-        
-        start_time = time.time()
-        prime_count = 0
-        
-        # Calculate primes up to 50000
-        for i in range(2, 50000):
-            if is_prime(i):
-                prime_count += 1
-        
-        cpu_time = time.time() - start_time
-        
-        # Mathematical operations test
-        start_time = time.time()
-        result = 0
-        for i in range(1000000):
-            result += math.sin(i) * math.cos(i) + math.sqrt(i + 1)
-        
-        math_time = time.time() - start_time
-        
-        # Fibonacci calculation test
-        def fibonacci(n):
+
+        def fibonacci(n: int) -> int:
+            """Compute Fibonacci number recursively"""
             if n <= 1:
                 return n
-            return fibonacci(n-1) + fibonacci(n-2)
-        
+            return fibonacci(n - 1) + fibonacci(n - 2)
+
         start_time = time.time()
-        fib_result = fibonacci(35)
-        fib_time = time.time() - start_time
-        
-        total_cpu_time = cpu_time + math_time + fib_time
-        
-        # Calculate CPU score as operations per second (higher = better)
-        # Use inverse of time multiplied by operation count for meaningful comparison
-        cpu_score = int((prime_count + 1000000 + 35) / total_cpu_time)
-        
+        prime_count = 0
+        operations = 0
+        current = 2
+
+        # Run a mix of operations until the duration expires
+        while time.time() - start_time < duration:
+            if is_prime(current):
+                prime_count += 1
+            _ = math.sin(current) * math.cos(current) + math.sqrt(current)
+            _ = fibonacci(20)
+            operations += 1
+            current += 1
+
+        cpu_time = time.time() - start_time
+        cpu_score = int(operations / cpu_time)
+
         self.results['cpu'] = {
-            'prime_time': cpu_time,
-            'math_time': math_time,
-            'fibonacci_time': fib_time,
-            'total_time': total_cpu_time,
+            'duration': cpu_time,
+            'operations': operations,
             'score': cpu_score,
             'primes_found': prime_count
         }
-        
-        print(f"   Prime calculation: {cpu_time:.2f}s ({prime_count} primes found)")
-        print(f"   Math operations: {math_time:.2f}s")
-        print(f"   Fibonacci(35): {fib_time:.2f}s")
+
+        print(f"   Duration: {cpu_time:.2f}s")
+        print(f"   Operations performed: {operations}")
         print(f"   CPU Score: {cpu_score} ops/sec")
     
     def drive_sequential_test(self, file_size_mb=100):
@@ -193,7 +179,7 @@ class PerformanceTest:
         
         try:
             # CPU Test
-            self.cpu_single_core_test()
+            self.cpu_single_core_test(duration=10)
             print()
             
             # Drive Tests
@@ -216,9 +202,9 @@ class PerformanceTest:
             rand = self.results['random']
             
             print(f"CPU Tests:")
-            print(f"  • Prime calculation: {cpu['prime_time']:.2f}s")
-            print(f"  • Math operations: {cpu['math_time']:.2f}s")
-            print(f"  • Fibonacci: {cpu['fibonacci_time']:.2f}s")
+            print(f"  • Duration: {cpu['duration']:.2f}s")
+            print(f"  • Operations: {cpu['operations']}")
+            print(f"  • Primes found: {cpu['primes_found']}")
             print()
             
             print(f"Drive Tests:")

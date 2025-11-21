@@ -13,6 +13,10 @@ curl -fsSL https://raw.githubusercontent.com/AndreiMarhatau/perf-test/main/main.
 ```pwsh
 (iwr -useb https://raw.githubusercontent.com/AndreiMarhatau/perf-test/main/windows.py).Content | python - --cpu-mode multi --cpu-duration 15 --skip-drive
 ```
+- iOS (a-Shell):
+```bash
+curl -fsSL https://raw.githubusercontent.com/AndreiMarhatau/perf-test/main/ios.py | python3 - --cpu-mode multi --cpu-duration 15 --skip-drive
+```
 
 ### Common one-liners
 - Quick multi-core check (15s):
@@ -29,9 +33,7 @@ curl -fsSL https://raw.githubusercontent.com/AndreiMarhatau/perf-test/main/main.
 ```
 
 **Windows note:** Use `windows.py`; it downloads `main.py` to a temp file, runs it, then deletes the temp file so multiprocessing works from a one-liner.
-
-### iPhone
-Use one of the apps that let you run python code, or even bash commands. A-shell works well - just run above bash command there.
+**iPhone note:** Use `ios.py`; it downloads `main.py` to a temp file, runs it, then deletes the temp file so multiprocessing works from a one-liner in a-Shell.
 
 ## CLI Options
 

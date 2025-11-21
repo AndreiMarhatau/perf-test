@@ -33,7 +33,7 @@ curl -fsSL https://raw.githubusercontent.com/AndreiMarhatau/perf-test/main/main.
 ```
 
 **Windows note:** Use `windows.py`; it downloads `main.py` to a temp file, runs it, then deletes the temp file so multiprocessing works from a one-liner.
-**iPhone note:** Use `ios.py`; it downloads `main.py` to a temp file, runs it, then deletes the temp file so multiprocessing works from a one-liner in a-Shell.
+**iPhone note:** Use `ios.py`; it downloads `main.py` to a temp file, runs it with spawn mode forced, then deletes the temp file so multiprocessing works from a one-liner in a-Shell.
 
 ## CLI Options
 

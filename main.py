@@ -130,7 +130,11 @@ class PerformanceTest:
             workers = os.cpu_count() or 1
         print(f"🔥 Testing CPU Multi-Core Performance with {workers} workers...")
 
-        start_method = "fork" if "fork" in mp.get_all_start_methods() else "spawn"
+        forced_method = os.environ.get("PERF_TEST_START_METHOD", "").strip().lower()
+        if forced_method in {"fork", "spawn"}:
+            start_method = forced_method
+        else:
+            start_method = "fork" if "fork" in mp.get_all_start_methods() else "spawn"
         ctx = mp.get_context(start_method)
         pool_factory = lambda: ctx.Pool(processes=workers)
 

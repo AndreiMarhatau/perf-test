@@ -18,7 +18,9 @@ def run():
         with os.fdopen(fd, "wb") as tmp:
             tmp.write(urlopen(MAIN_URL).read())
 
-        result = subprocess.run([sys.executable, temp_path] + sys.argv[1:])
+        env = os.environ.copy()
+        env["PERF_TEST_START_METHOD"] = "spawn"
+        result = subprocess.run([sys.executable, temp_path] + sys.argv[1:], env=env)
         sys.exit(result.returncode)
     finally:
         try:

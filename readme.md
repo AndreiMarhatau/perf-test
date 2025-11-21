@@ -14,6 +14,20 @@ curl -fsSL https://raw.githubusercontent.com/AndreiMarhatau/perf-test/main/main.
 (iwr -useb https://raw.githubusercontent.com/AndreiMarhatau/perf-test/main/main.py).Content | python - --cpu-mode multi --cpu-duration 15 --skip-drive
 ```
 
+### Common one-liners
+- Quick multi-core check (15s):
+```bash
+curl -fsSL https://raw.githubusercontent.com/AndreiMarhatau/perf-test/main/main.py | python3 - --cpu-mode multi --cpu-duration 15
+```
+- Longer CPU stress (10 minutes, multi-core, skip drive):
+```bash
+curl -fsSL https://raw.githubusercontent.com/AndreiMarhatau/perf-test/main/main.py | python3 - --cpu-mode multi --cpu-duration 600 --skip-drive
+```
+- Quick single-core sanity test (10s):
+```bash
+curl -fsSL https://raw.githubusercontent.com/AndreiMarhatau/perf-test/main/main.py | python3 - --cpu-mode single --cpu-duration 10
+```
+
 ### iPhone
 Use one of the apps that let you run python code, or even bash commands. A-shell works well - just run above bash command there.
 

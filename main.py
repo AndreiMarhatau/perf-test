@@ -130,6 +130,11 @@ class PerformanceTest:
             workers = os.cpu_count() or 1
         print(f"🔥 Testing CPU Multi-Core Performance with {workers} workers...")
 
+        # Prefer fork when available so the script can run from stdin/one-liners
+        # without requiring an importable module path (spawn fails for `<stdin>`).
+        start_method = "fork" if "fork" in mp.get_all_start_methods() else "spawn"
+        ctx = mp.get_context(start_method)
+
         slices = 10
         slice_dur = duration / slices if duration > 0 else 1.0
         total_ops = 0
@@ -139,7 +144,7 @@ class PerformanceTest:
         bar_width = 40
         max_rate_seen = 0.0
         print("   CPU ops/sec over time:")
-        with mp.Pool(processes=workers) as pool:
+        with ctx.Pool(processes=workers) as pool:
             for i in range(slices):
                 results = pool.starmap(_cpu_burn_worker, [(slice_dur, 1)] * workers)
                 slice_ops = sum(r["operations"] for r in results)

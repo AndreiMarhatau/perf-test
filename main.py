@@ -10,7 +10,8 @@ import tempfile
 import math
 import argparse
 import multiprocessing as mp
-from typing import Optional
+import queue
+from typing import Optional, Callable
 
 
 def _is_prime(n: int) -> bool:
@@ -30,7 +31,14 @@ def _fibonacci(n: int) -> int:
     return _fibonacci(n - 1) + _fibonacci(n - 2)
 
 
-def _cpu_burn_worker(duration: float, num_slices: int = 10) -> dict:
+def _cpu_burn_worker(
+    duration: float,
+    num_slices: int = 10,
+    status_interval: Optional[float] = None,
+    status_callback: Optional[Callable[[int, float, float], None]] = None,
+    status_queue: Optional[mp.Queue] = None,
+    worker_id: Optional[int] = None,
+) -> dict:
     """Worker that burns CPU for approximately `duration` seconds.
 
     Returns dict with operations, primes_found, and measured duration.
@@ -45,6 +53,9 @@ def _cpu_burn_worker(duration: float, num_slices: int = 10) -> dict:
     next_cutoff = slice_len  # seconds since start
     slice_idx = 0
 
+    last_status_time = start_time
+    last_status_ops = 0
+
     while time.time() - start_time < duration:
         if _is_prime(current):
             prime_count += 1
@@ -52,6 +63,17 @@ def _cpu_burn_worker(duration: float, num_slices: int = 10) -> dict:
         _ = _fibonacci(20)
         operations += 1
         current += 1
+        if status_interval and (status_callback or status_queue is not None):
+            now = time.time()
+            elapsed_since_status = now - last_status_time
+            if elapsed_since_status >= status_interval:
+                delta_ops = operations - last_status_ops
+                if status_callback:
+                    status_callback(delta_ops, elapsed_since_status, now - start_time)
+                if status_queue is not None:
+                    status_queue.put((worker_id, operations, now - start_time))
+                last_status_time = now
+                last_status_ops = operations
         # Increment current slice counter, advance slice when passing cutoff
         if slice_idx < len(ops_slices):
             ops_slices[slice_idx] += 1
@@ -82,14 +104,21 @@ class PerformanceTest:
         slices = 10
         slice_dur = duration / slices if duration > 0 else 1.0
         ops_slices = []
+        last_rate = None
         total_ops = 0
         prime_total = 0
         bar_width = 40
         max_rate_seen = 0.0
         print("   CPU ops/sec over time:")
+        # live line updated during each slice (single persistent line at bottom)
+        print("   Current ops/sec: ---", end="", flush=True)
         start_total = time.time()
         for i in range(slices):
-            res = _cpu_burn_worker(slice_dur, num_slices=1)
+            def _update_live(delta_ops: int, delta_t: float, _total: float):
+                rate = int(delta_ops / delta_t) if delta_t > 0 else 0
+                print(f"\r\033[K   Current ops/sec: {rate:5d}", end="", flush=True)
+
+            res = _cpu_burn_worker(slice_dur, num_slices=1, status_interval=0.25, status_callback=_update_live)
             ops = res["operations"]
             prime = res["primes_found"]
             elapsed = res["duration"] or slice_dur
@@ -99,10 +128,19 @@ class PerformanceTest:
             rate = ops / elapsed if elapsed > 0 else 0
             if rate > max_rate_seen:
                 max_rate_seen = rate
-            bar_len = int((rate / max_rate_seen) * bar_width) if max_rate_seen > 0 else 0
+            last_rate = rate
+            # clear live line, print bar, then re-establish live line (except after last slice)
+            print("\r\033[K", end="", flush=True)
             lo = int(i * (100 / slices))
             hi = int((i + 1) * (100 / slices))
-            print(f"    {i+1:02d} [{lo:02d}-{hi:02d}%] {('█' * bar_len).ljust(bar_width)} {int(rate)}", flush=True)
+            bar_len = int((rate / max_rate_seen) * bar_width) if max_rate_seen > 0 else 0
+            print(f"    {i+1:02d} [{lo:02d}-{hi:02d}%] {('█' * bar_len).ljust(bar_width)} {int(rate)} ops/s")
+            if i < slices - 1:
+                shown = f"{int(last_rate):5d}" if last_rate is not None else "---"
+                print(f"   Current ops/sec: {shown}", end="", flush=True)
+        # clear live line at end
+        print("\r\033[K", end="")
+        print()
 
         cpu_time = time.time() - start_total
         cpu_score = int(total_ops / cpu_time) if cpu_time > 0 else 0
@@ -140,13 +178,54 @@ class PerformanceTest:
         total_primes = 0
         total_wall_time = 0.0
         agg_slices = []
+        last_rate = None
         bar_width = 40
         max_rate_seen = 0.0
         print("   CPU ops/sec over time:")
+        print("   Current ops/sec: ---", end="", flush=True)
+        manager = mp.Manager()
+        status_q = manager.Queue()
         pool = pool_factory()
+
         try:
             for i in range(slices):
-                results = pool.starmap(_cpu_burn_worker, [(slice_dur, 1)] * workers)
+                # launch workers asynchronously so we can read live updates
+                jobs = [
+                    pool.apply_async(
+                        _cpu_burn_worker,
+                        kwds={
+                            "duration": slice_dur,
+                            "num_slices": 1,
+                            "status_interval": 0.25,
+                            "status_queue": status_q,
+                            "worker_id": w,
+                        },
+                    )
+                    for w in range(workers)
+                ]
+
+                latest = {}
+                # poll queue while workers run
+                while True:
+                    all_ready = all(j.ready() for j in jobs)
+                    drained = False
+                    while True:
+                        try:
+                            wid, ops_done, elapsed = status_q.get_nowait()
+                            latest[wid] = (ops_done, elapsed)
+                            drained = True
+                        except queue.Empty:
+                            break
+                    if drained and latest:
+                        total_ops_now = sum(v[0] for v in latest.values())
+                        max_elapsed = max(v[1] for v in latest.values())
+                        live_rate = int(total_ops_now / max_elapsed) if max_elapsed > 0 else 0
+                        print(f"\r\033[K   Current ops/sec: {live_rate:5d}", end="", flush=True)
+                    if all_ready and not drained and status_q.empty():
+                        break
+                    time.sleep(0.05)
+
+                results = [j.get() for j in jobs]
                 slice_ops = sum(r["operations"] for r in results)
                 slice_primes = sum(r["primes_found"] for r in results)
                 slice_time = max(r["duration"] for r in results) if results else slice_dur
@@ -156,15 +235,30 @@ class PerformanceTest:
                 agg_slices.append(slice_ops)
 
                 rate = slice_ops / slice_time if slice_time > 0 else 0
+                # clear live line, print bar, then re-establish live line (except after last slice)
                 if rate > max_rate_seen:
                     max_rate_seen = rate
-                bar_len = int((rate / max_rate_seen) * bar_width) if max_rate_seen > 0 else 0
+                last_rate = rate
+                print("\r\033[K", end="", flush=True)
                 lo = int(i * (100 / slices))
                 hi = int((i + 1) * (100 / slices))
-                print(f"    {i+1:02d} [{lo:02d}-{hi:02d}%] {('█' * bar_len).ljust(bar_width)} {int(rate)}", flush=True)
+                bar_len = int((rate / max_rate_seen) * bar_width) if max_rate_seen > 0 else 0
+                print(f"    {i+1:02d} [{lo:02d}-{hi:02d}%] {('█' * bar_len).ljust(bar_width)} {int(rate)} ops/s")
+            if i < slices - 1:
+                shown = f"{int(last_rate):5d}" if last_rate is not None else "---"
+                print(f"   Current ops/sec: {shown}", end="", flush=True)
+        except KeyboardInterrupt:
+            pool.terminate()
+            pool.join()
+            manager.shutdown()
+            raise
         finally:
             pool.close()
             pool.join()
+            manager.shutdown()
+        # clear live line after loop
+        print("\r\033[K", end="")
+        print()
 
         cpu_score = int(total_ops / total_wall_time) if total_wall_time > 0 else 0
 
@@ -288,11 +382,15 @@ class PerformanceTest:
         
         return drive_score
     
-    def run_all_tests(self, cpu_mode: str = 'single', cpu_duration: int = 10, cpu_workers: Optional[int] = None, skip_drive: bool = False):
+    def run_all_tests(self, cpu_mode: str = 'single', cpu_duration: int = 10, cpu_workers: Optional[int] = None, skip_drive: bool = True):
         """Run all performance tests"""
         print("🚀 Starting PC Performance Test Suite")
         print("=" * 50)
-        
+
+        if skip_drive:
+            print("ℹ️  Drive tests skipped (enable with --with-drive)")
+            print()
+
         try:
             # CPU Test
             if cpu_mode == 'multi':
@@ -363,7 +461,9 @@ def main():
     parser.add_argument("--cpu-mode", choices=["single", "multi"], default="single", help="CPU test mode")
     parser.add_argument("--cpu-duration", type=int, default=10, help="CPU test duration in seconds")
     parser.add_argument("--cpu-workers", type=int, default=None, help="Number of workers for multi-core test (default: CPU count)")
-    parser.add_argument("--skip-drive", action="store_true", help="Skip drive tests and run CPU only")
+
+    parser.add_argument("--with-drive", dest="skip_drive", action="store_false", help="Include drive tests (default is CPU-only)")
+    parser.set_defaults(skip_drive=True)
     args = parser.parse_args()
 
     test = PerformanceTest()

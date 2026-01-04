@@ -183,7 +183,7 @@ class PerformanceTest:
         max_rate_seen = 0.0
         print("   CPU ops/sec over time:")
         print("   Current ops/sec: ---", end="", flush=True)
-        manager = mp.Manager()
+        manager = ctx.Manager()
         status_q = manager.Queue()
         pool = pool_factory()
 

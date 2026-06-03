@@ -42,6 +42,10 @@ curl -fsSL https://raw.githubusercontent.com/AndreiMarhatau/perf-test/main/main.
 - `--cpu-workers <N>`: Number of workers in multi-core mode (default: CPU count)
 - `--with-drive`: Include drive tests (default is CPU-only)
 
+## Interpreting CPU Results
+
+The CPU score is reported as `SHA-256 MiB/sec`. It means how many 1 MiB chunks the CPU can hash per second using Python's standard-library SHA-256 implementation. Higher is better; this is CPU hashing throughput, not drive speed.
+
 ### Examples
 
 - Default run (single-core, 10s, no drive tests):

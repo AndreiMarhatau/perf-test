@@ -7,28 +7,16 @@ import time
 import os
 import random
 import tempfile
-import math
+import hashlib
 import argparse
 import multiprocessing as mp
 import queue
 from typing import Optional, Callable
 
-
-def _is_prime(n: int) -> bool:
-    """Check if a number is prime"""
-    if n < 2:
-        return False
-    for i in range(2, int(math.sqrt(n)) + 1):
-        if n % i == 0:
-            return False
-    return True
-
-
-def _fibonacci(n: int) -> int:
-    """Compute Fibonacci number recursively (intentionally CPU heavy)"""
-    if n <= 1:
-        return n
-    return _fibonacci(n - 1) + _fibonacci(n - 2)
+NATIVE_CPU_CHUNK_BYTES = 1024 * 1024
+NATIVE_CPU_CHUNK = (
+    b"perf-test-cpu-" * ((NATIVE_CPU_CHUNK_BYTES // len(b"perf-test-cpu-")) + 1)
+)[:NATIVE_CPU_CHUNK_BYTES]
 
 
 def _cpu_burn_worker(
@@ -41,12 +29,10 @@ def _cpu_burn_worker(
 ) -> dict:
     """Worker that burns CPU for approximately `duration` seconds.
 
-    Returns dict with operations, primes_found, and measured duration.
+    Returns dict with hashed MiB, measured duration, and slice data.
     """
     start_time = time.time()
-    prime_count = 0
     operations = 0
-    current = 2
     # Track operations per time slice for simple timeseries output
     ops_slices = [0] * max(1, int(num_slices))
     slice_len = duration / len(ops_slices) if duration > 0 else 1.0
@@ -57,12 +43,9 @@ def _cpu_burn_worker(
     last_status_ops = 0
 
     while time.time() - start_time < duration:
-        if _is_prime(current):
-            prime_count += 1
-        _ = math.sin(current) * math.cos(current) + math.sqrt(current)
-        _ = _fibonacci(20)
-        operations += 1
-        current += 1
+        _ = hashlib.sha256(NATIVE_CPU_CHUNK).digest()
+        operation_delta = 1
+        operations += operation_delta
         if status_interval and (status_callback or status_queue is not None):
             now = time.time()
             elapsed_since_status = now - last_status_time
@@ -76,14 +59,14 @@ def _cpu_burn_worker(
                 last_status_ops = operations
         # Increment current slice counter, advance slice when passing cutoff
         if slice_idx < len(ops_slices):
-            ops_slices[slice_idx] += 1
+            ops_slices[slice_idx] += operation_delta
             elapsed = time.time() - start_time
             while elapsed >= next_cutoff and slice_idx < len(ops_slices) - 1:
                 slice_idx += 1
                 next_cutoff += slice_len
 
     elapsed = time.time() - start_time
-    return {"operations": operations, "primes_found": prime_count, "duration": elapsed, "ops_slices": ops_slices}
+    return {"operations": operations, "duration": elapsed, "ops_slices": ops_slices}
 
 class PerformanceTest:
     def __init__(self):
@@ -101,29 +84,32 @@ class PerformanceTest:
     def cpu_single_core_test(self, duration=10):
         """Test CPU single-core performance for a fixed duration"""
         print("🔥 Testing CPU Single-Core Performance...")
+        unit_label = "SHA-256 MiB/sec"
         slices = 10
         slice_dur = duration / slices if duration > 0 else 1.0
         ops_slices = []
         last_rate = None
         total_ops = 0
-        prime_total = 0
         bar_width = 40
         max_rate_seen = 0.0
-        print("   CPU ops/sec over time:")
+        print(f"   CPU {unit_label} over time:")
         # live line updated during each slice (single persistent line at bottom)
-        print("   Current ops/sec: ---", end="", flush=True)
+        print(f"   Current {unit_label}: ---", end="", flush=True)
         start_total = time.time()
         for i in range(slices):
             def _update_live(delta_ops: int, delta_t: float, _total: float):
                 rate = int(delta_ops / delta_t) if delta_t > 0 else 0
-                print(f"\r\033[K   Current ops/sec: {rate:5d}", end="", flush=True)
+                print(f"\r\033[K   Current {unit_label}: {rate:5d}", end="", flush=True)
 
-            res = _cpu_burn_worker(slice_dur, num_slices=1, status_interval=0.25, status_callback=_update_live)
+            res = _cpu_burn_worker(
+                slice_dur,
+                num_slices=1,
+                status_interval=0.25,
+                status_callback=_update_live,
+            )
             ops = res["operations"]
-            prime = res["primes_found"]
             elapsed = res["duration"] or slice_dur
             total_ops += ops
-            prime_total += prime
             ops_slices.append(ops)
             rate = ops / elapsed if elapsed > 0 else 0
             if rate > max_rate_seen:
@@ -134,10 +120,10 @@ class PerformanceTest:
             lo = int(i * (100 / slices))
             hi = int((i + 1) * (100 / slices))
             bar_len = int((rate / max_rate_seen) * bar_width) if max_rate_seen > 0 else 0
-            print(f"    {i+1:02d} [{lo:02d}-{hi:02d}%] {('█' * bar_len).ljust(bar_width)} {int(rate)} ops/s")
+            print(f"    {i+1:02d} [{lo:02d}-{hi:02d}%] {('█' * bar_len).ljust(bar_width)} {int(rate)} {unit_label}")
             if i < slices - 1:
                 shown = f"{int(last_rate):5d}" if last_rate is not None else "---"
-                print(f"   Current ops/sec: {shown}", end="", flush=True)
+                print(f"   Current {unit_label}: {shown}", end="", flush=True)
         # clear live line at end
         print("\r\033[K", end="")
         print()
@@ -150,23 +136,28 @@ class PerformanceTest:
             'duration': cpu_time,
             'operations': total_ops,
             'score': cpu_score,
-            'primes_found': prime_total,
             'workers': 1,
+            'unit_label': unit_label,
             'ops_slices': ops_slices,
             'slice_count': len(ops_slices),
             'planned_duration': duration
         }
 
-        print(f"    max≈{int(max_rate_seen)} ops/s")
+        print(f"    max≈{int(max_rate_seen)} {unit_label}")
         print(f"   Duration: {cpu_time:.2f}s")
-        print(f"   Operations performed: {total_ops}")
-        print(f"   CPU Score: {cpu_score} ops/sec")
+        print(f"   MiB hashed: {total_ops}")
+        print(f"   CPU Score: {cpu_score} {unit_label}")
 
-    def cpu_multi_core_test(self, duration=10, workers: Optional[int] = None):
+    def cpu_multi_core_test(
+        self,
+        duration=10,
+        workers: Optional[int] = None,
+    ):
         """Test CPU multi-core performance by running N workers in parallel."""
         if workers is None or workers <= 0:
             workers = os.cpu_count() or 1
         print(f"🔥 Testing CPU Multi-Core Performance with {workers} workers...")
+        unit_label = "SHA-256 MiB/sec"
 
         start_method = "fork" if "fork" in mp.get_all_start_methods() else "spawn"
         ctx = mp.get_context(start_method)
@@ -175,14 +166,13 @@ class PerformanceTest:
         slices = 10
         slice_dur = duration / slices if duration > 0 else 1.0
         total_ops = 0
-        total_primes = 0
         total_wall_time = 0.0
         agg_slices = []
         last_rate = None
         bar_width = 40
         max_rate_seen = 0.0
-        print("   CPU ops/sec over time:")
-        print("   Current ops/sec: ---", end="", flush=True)
+        print(f"   CPU {unit_label} over time:")
+        print(f"   Current {unit_label}: ---", end="", flush=True)
         manager = ctx.Manager()
         status_q = manager.Queue()
         pool = pool_factory()
@@ -220,17 +210,15 @@ class PerformanceTest:
                         total_ops_now = sum(v[0] for v in latest.values())
                         max_elapsed = max(v[1] for v in latest.values())
                         live_rate = int(total_ops_now / max_elapsed) if max_elapsed > 0 else 0
-                        print(f"\r\033[K   Current ops/sec: {live_rate:5d}", end="", flush=True)
+                        print(f"\r\033[K   Current {unit_label}: {live_rate:5d}", end="", flush=True)
                     if all_ready and not drained and status_q.empty():
                         break
                     time.sleep(0.05)
 
                 results = [j.get() for j in jobs]
                 slice_ops = sum(r["operations"] for r in results)
-                slice_primes = sum(r["primes_found"] for r in results)
                 slice_time = max(r["duration"] for r in results) if results else slice_dur
                 total_ops += slice_ops
-                total_primes += slice_primes
                 total_wall_time += slice_time
                 agg_slices.append(slice_ops)
 
@@ -243,10 +231,10 @@ class PerformanceTest:
                 lo = int(i * (100 / slices))
                 hi = int((i + 1) * (100 / slices))
                 bar_len = int((rate / max_rate_seen) * bar_width) if max_rate_seen > 0 else 0
-                print(f"    {i+1:02d} [{lo:02d}-{hi:02d}%] {('█' * bar_len).ljust(bar_width)} {int(rate)} ops/s")
+                print(f"    {i+1:02d} [{lo:02d}-{hi:02d}%] {('█' * bar_len).ljust(bar_width)} {int(rate)} {unit_label}")
             if i < slices - 1:
                 shown = f"{int(last_rate):5d}" if last_rate is not None else "---"
-                print(f"   Current ops/sec: {shown}", end="", flush=True)
+                print(f"   Current {unit_label}: {shown}", end="", flush=True)
         except KeyboardInterrupt:
             pool.terminate()
             pool.join()
@@ -267,17 +255,17 @@ class PerformanceTest:
             'duration': total_wall_time,
             'operations': total_ops,
             'score': cpu_score,
-            'primes_found': total_primes,
             'workers': workers,
+            'unit_label': unit_label,
             'ops_slices': agg_slices,
             'slice_count': len(agg_slices),
             'planned_duration': duration
         }
 
-        print(f"    max≈{int(max_rate_seen)} ops/s")
+        print(f"    max≈{int(max_rate_seen)} {unit_label}")
         print(f"   Duration: {total_wall_time:.2f}s")
-        print(f"   Total operations: {total_ops}")
-        print(f"   Aggregate CPU Score: {cpu_score} ops/sec")
+        print(f"   Total MiB hashed: {total_ops}")
+        print(f"   Aggregate CPU Score: {cpu_score} {unit_label}")
     
     def drive_sequential_test(self, file_size_mb=100):
         """Test sequential read/write performance"""
@@ -382,7 +370,13 @@ class PerformanceTest:
         
         return drive_score
     
-    def run_all_tests(self, cpu_mode: str = 'single', cpu_duration: int = 10, cpu_workers: Optional[int] = None, skip_drive: bool = True):
+    def run_all_tests(
+        self,
+        cpu_mode: str = 'single',
+        cpu_duration: int = 10,
+        cpu_workers: Optional[int] = None,
+        skip_drive: bool = True,
+    ):
         """Run all performance tests"""
         print("🚀 Starting PC Performance Test Suite")
         print("=" * 50)
@@ -394,9 +388,14 @@ class PerformanceTest:
         try:
             # CPU Test
             if cpu_mode == 'multi':
-                self.cpu_multi_core_test(duration=cpu_duration, workers=cpu_workers)
+                self.cpu_multi_core_test(
+                    duration=cpu_duration,
+                    workers=cpu_workers,
+                )
             else:
-                self.cpu_single_core_test(duration=cpu_duration)
+                self.cpu_single_core_test(
+                    duration=cpu_duration,
+                )
             print()
             
             # Drive Tests (optional)
@@ -426,9 +425,9 @@ class PerformanceTest:
             
             print(f"CPU Tests:")
             print(f"  • Mode: {cpu['mode']} ({cpu['workers']} worker(s))")
+            print(f"  • Workload: SHA-256 hashing (1 MiB chunks)")
             print(f"  • Duration: {cpu['duration']:.2f}s")
-            print(f"  • Operations: {cpu['operations']}")
-            print(f"  • Primes found: {cpu['primes_found']}")
+            print(f"  • MiB hashed: {cpu['operations']}")
             
             if not skip_drive:
                 print(f"Drive Tests:")
@@ -441,7 +440,7 @@ class PerformanceTest:
             # Display final results
             print("📊 PERFORMANCE RESULTS")
             print("=" * 50)
-            print(f"CPU Performance Score:    {cpu_score:8d} ops/sec")
+            print(f"CPU Performance Score:    {cpu_score:8d} {cpu['unit_label']}")
             if not skip_drive:
                 print(f"Drive Performance Score:  {drive_score:8d} composite")
                 print(f"Overall Performance Score: {overall_score:8d} combined")
@@ -467,7 +466,12 @@ def main():
     args = parser.parse_args()
 
     test = PerformanceTest()
-    test.run_all_tests(cpu_mode=args.cpu_mode, cpu_duration=args.cpu_duration, cpu_workers=args.cpu_workers, skip_drive=args.skip_drive)
+    test.run_all_tests(
+        cpu_mode=args.cpu_mode,
+        cpu_duration=args.cpu_duration,
+        cpu_workers=args.cpu_workers,
+        skip_drive=args.skip_drive,
+    )
 
 if __name__ == "__main__":
     main()

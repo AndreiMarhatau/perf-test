@@ -32,6 +32,10 @@ curl -fsSL https://raw.githubusercontent.com/AndreiMarhatau/perf-test/main/main.
 ```bash
 curl -fsSL https://raw.githubusercontent.com/AndreiMarhatau/perf-test/main/main.py | python3 - --cpu-mode multi --cpu-duration 15 --with-drive
 ```
+- Quick drive smoke test with a smaller sequential file:
+```bash
+curl -fsSL https://raw.githubusercontent.com/AndreiMarhatau/perf-test/main/main.py | python3 - --with-drive --drive-size-mb 128
+```
 
 **Windows note:** Use `windows.py`; it downloads `main.py` to a temp file, runs it, then deletes the temp file so multiprocessing works from a one-liner.
 
@@ -41,10 +45,17 @@ curl -fsSL https://raw.githubusercontent.com/AndreiMarhatau/perf-test/main/main.
 - `--cpu-duration <seconds>`: CPU test duration in seconds (default: 10)
 - `--cpu-workers <N>`: Number of workers in multi-core mode (default: CPU count)
 - `--with-drive`: Include drive tests (default is CPU-only)
+- `--drive-size-mb <MB>`: Sequential drive test file size (default: 1024 MB)
 
 ## Interpreting CPU Results
 
 The CPU score is reported as `SHA-256 MiB/sec`. It means how many 1 MiB chunks the CPU can hash per second using Python's standard-library SHA-256 implementation. Higher is better; this is CPU hashing throughput, not drive speed.
+
+## Interpreting Drive Results
+
+The sequential drive test uses a 1 GiB test file by default, writes deterministic non-compressible data, requests uncached file I/O where the OS supports it, and flushes writes before reporting write throughput. On macOS it uses `F_NOCACHE` and `F_FULLFSYNC`; on platforms with `posix_fadvise`, it also uses sequential and cache-drop hints.
+
+Use `--drive-size-mb` for a faster smoke run. Smaller files run faster but are more likely to be affected by cache and filesystem behavior.
 
 ### Examples
 

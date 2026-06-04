@@ -11,12 +11,79 @@ import hashlib
 import argparse
 import multiprocessing as mp
 import queue
+import sys
 from typing import Optional, Callable
 
 NATIVE_CPU_CHUNK_BYTES = 1024 * 1024
 NATIVE_CPU_CHUNK = (
     b"perf-test-cpu-" * ((NATIVE_CPU_CHUNK_BYTES // len(b"perf-test-cpu-")) + 1)
 )[:NATIVE_CPU_CHUNK_BYTES]
+DRIVE_BLOCK_BYTES = 1024 * 1024
+DEFAULT_DRIVE_FILE_SIZE_MB = 1024
+MACOS_F_NOCACHE = 48
+MACOS_F_FULLFSYNC = 51
+
+
+def _make_drive_chunk(size: int = DRIVE_BLOCK_BYTES) -> bytes:
+    """Build a deterministic, non-compressible block outside the timed section."""
+    chunk = bytearray()
+    counter = 0
+    seed = b"perf-test-drive-chunk"
+    while len(chunk) < size:
+        chunk.extend(hashlib.sha256(seed + counter.to_bytes(8, "little")).digest())
+        counter += 1
+    return bytes(chunk[:size])
+
+
+def _enable_uncached_io(file_obj) -> list[str]:
+    """Ask the OS to avoid page-cache effects for this benchmark file."""
+    enabled = []
+    fd = file_obj.fileno()
+
+    if sys.platform == "darwin":
+        try:
+            import fcntl
+            fcntl.fcntl(fd, MACOS_F_NOCACHE, 1)
+            enabled.append("F_NOCACHE")
+        except OSError:
+            pass
+
+    if hasattr(os, "posix_fadvise"):
+        try:
+            os.posix_fadvise(fd, 0, 0, os.POSIX_FADV_SEQUENTIAL)
+            enabled.append("POSIX_FADV_SEQUENTIAL")
+        except (AttributeError, OSError):
+            pass
+
+    return enabled
+
+
+def _drop_file_cache(file_obj) -> bool:
+    """Drop this file from cache on platforms that expose posix_fadvise."""
+    if not hasattr(os, "posix_fadvise"):
+        return False
+    try:
+        os.posix_fadvise(file_obj.fileno(), 0, 0, os.POSIX_FADV_DONTNEED)
+        return True
+    except (AttributeError, OSError):
+        return False
+
+
+def _sync_file_to_storage(file_obj) -> str:
+    """Flush buffered writes so write timing includes persistence work."""
+    file_obj.flush()
+    fd = file_obj.fileno()
+
+    if sys.platform == "darwin":
+        try:
+            import fcntl
+            fcntl.fcntl(fd, MACOS_F_FULLFSYNC)
+            return "F_FULLFSYNC"
+        except OSError:
+            pass
+
+    os.fsync(fd)
+    return "fsync"
 
 
 def _cpu_burn_worker(
@@ -267,27 +334,34 @@ class PerformanceTest:
         print(f"   Total MiB hashed: {total_ops}")
         print(f"   Aggregate CPU Score: {cpu_score} {unit_label}")
     
-    def drive_sequential_test(self, file_size_mb=100):
+    def drive_sequential_test(self, file_size_mb=DEFAULT_DRIVE_FILE_SIZE_MB):
         """Test sequential read/write performance"""
         print("💾 Testing Drive Sequential Performance...")
         
         test_file = os.path.join(self.temp_dir, "sequential_test.dat")
-        data_chunk = b'A' * (1024 * 1024)  # 1MB chunk
+        data_chunk = _make_drive_chunk()
+        uncached_modes = set()
+        sync_mode = "none"
         
         # Sequential Write Test
-        start_time = time.time()
-        with open(test_file, 'wb') as f:
+        start_time = time.perf_counter()
+        with open(test_file, 'wb', buffering=0) as f:
+            uncached_modes.update(_enable_uncached_io(f))
             for _ in range(file_size_mb):
                 f.write(data_chunk)
-        write_time = time.time() - start_time
+            sync_mode = _sync_file_to_storage(f)
+            _drop_file_cache(f)
+        write_time = time.perf_counter() - start_time
         write_speed = file_size_mb / write_time  # MB/s
         
         # Sequential Read Test
-        start_time = time.time()
-        with open(test_file, 'rb') as f:
-            while f.read(1024 * 1024):
+        start_time = time.perf_counter()
+        with open(test_file, 'rb', buffering=0) as f:
+            uncached_modes.update(_enable_uncached_io(f))
+            while f.read(DRIVE_BLOCK_BYTES):
                 pass
-        read_time = time.time() - start_time
+            _drop_file_cache(f)
+        read_time = time.perf_counter() - start_time
         read_speed = file_size_mb / read_time  # MB/s
         
         # Clean up
@@ -298,9 +372,15 @@ class PerformanceTest:
             'read_time': read_time,
             'write_speed_mb_s': write_speed,
             'read_speed_mb_s': read_speed,
-            'file_size_mb': file_size_mb
+            'file_size_mb': file_size_mb,
+            'sync_mode': sync_mode,
+            'uncached_modes': sorted(uncached_modes)
         }
         
+        cache_note = ", ".join(sorted(uncached_modes)) if uncached_modes else "best-effort"
+        print(f"   Test File Size: {file_size_mb} MB")
+        print(f"   Cache Mode: {cache_note}")
+        print(f"   Write Flush: {sync_mode}")
         print(f"   Sequential Write: {write_speed:.1f} MB/s")
         print(f"   Sequential Read: {read_speed:.1f} MB/s")
     
@@ -376,6 +456,7 @@ class PerformanceTest:
         cpu_duration: int = 10,
         cpu_workers: Optional[int] = None,
         skip_drive: bool = True,
+        drive_size_mb: int = DEFAULT_DRIVE_FILE_SIZE_MB,
     ):
         """Run all performance tests"""
         print("🚀 Starting PC Performance Test Suite")
@@ -400,7 +481,7 @@ class PerformanceTest:
             
             # Drive Tests (optional)
             if not skip_drive:
-                self.drive_sequential_test()
+                self.drive_sequential_test(file_size_mb=drive_size_mb)
                 print()
                 
                 self.drive_random_test()
@@ -431,6 +512,9 @@ class PerformanceTest:
             
             if not skip_drive:
                 print(f"Drive Tests:")
+                print(f"  • Sequential Test Size: {seq['file_size_mb']} MB")
+                print(f"  • Cache Mode: {', '.join(seq['uncached_modes']) if seq['uncached_modes'] else 'best-effort'}")
+                print(f"  • Write Flush: {seq['sync_mode']}")
                 print(f"  • Sequential Write: {seq['write_speed_mb_s']:.1f} MB/s")
                 print(f"  • Sequential Read: {seq['read_speed_mb_s']:.1f} MB/s")
                 print(f"  • Random Read: {rand['read_iops']:.0f} IOPS")
@@ -462,8 +546,16 @@ def main():
     parser.add_argument("--cpu-workers", type=int, default=None, help="Number of workers for multi-core test (default: CPU count)")
 
     parser.add_argument("--with-drive", dest="skip_drive", action="store_false", help="Include drive tests (default is CPU-only)")
+    parser.add_argument(
+        "--drive-size-mb",
+        type=int,
+        default=DEFAULT_DRIVE_FILE_SIZE_MB,
+        help=f"Sequential drive test file size in MB (default: {DEFAULT_DRIVE_FILE_SIZE_MB})",
+    )
     parser.set_defaults(skip_drive=True)
     args = parser.parse_args()
+    if args.drive_size_mb < 1:
+        parser.error("--drive-size-mb must be at least 1")
 
     test = PerformanceTest()
     test.run_all_tests(
@@ -471,6 +563,7 @@ def main():
         cpu_duration=args.cpu_duration,
         cpu_workers=args.cpu_workers,
         skip_drive=args.skip_drive,
+        drive_size_mb=args.drive_size_mb,
     )
 
 if __name__ == "__main__":

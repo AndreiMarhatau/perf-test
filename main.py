@@ -11,7 +11,6 @@ import hashlib
 import argparse
 import multiprocessing as mp
 import queue
-import sys
 from typing import Optional, Callable
 
 NATIVE_CPU_CHUNK_BYTES = 1024 * 1024
@@ -20,8 +19,6 @@ NATIVE_CPU_CHUNK = (
 )[:NATIVE_CPU_CHUNK_BYTES]
 DRIVE_BLOCK_BYTES = 1024 * 1024
 DEFAULT_DRIVE_FILE_SIZE_MB = 1024
-MACOS_F_NOCACHE = 48
-MACOS_F_FULLFSYNC = 51
 
 
 def _make_drive_chunk(size: int = DRIVE_BLOCK_BYTES) -> bytes:
@@ -35,198 +32,33 @@ def _make_drive_chunk(size: int = DRIVE_BLOCK_BYTES) -> bytes:
     return bytes(chunk[:size])
 
 
-def _enable_uncached_io(file_obj) -> list[str]:
-    """Ask the OS to avoid page-cache effects for this benchmark file."""
-    enabled = []
-    fd = file_obj.fileno()
-
-    if sys.platform == "darwin":
-        try:
-            import fcntl
-            fcntl.fcntl(fd, MACOS_F_NOCACHE, 1)
-            enabled.append("F_NOCACHE")
-        except OSError:
-            pass
-
-    if hasattr(os, "posix_fadvise"):
-        try:
-            os.posix_fadvise(fd, 0, 0, os.POSIX_FADV_SEQUENTIAL)
-            enabled.append("POSIX_FADV_SEQUENTIAL")
-        except (AttributeError, OSError):
-            pass
-
-    return enabled
-
-
-def _drop_file_cache(file_obj) -> bool:
-    """Drop this file from cache on platforms that expose posix_fadvise."""
-    if not hasattr(os, "posix_fadvise"):
-        return False
-    try:
-        os.posix_fadvise(file_obj.fileno(), 0, 0, os.POSIX_FADV_DONTNEED)
-        return True
-    except (AttributeError, OSError):
-        return False
-
-
 def _sync_file_to_storage(file_obj) -> str:
     """Flush buffered writes so write timing includes persistence work."""
     file_obj.flush()
-    fd = file_obj.fileno()
-
-    if sys.platform == "darwin":
-        try:
-            import fcntl
-            fcntl.fcntl(fd, MACOS_F_FULLFSYNC)
-            return "F_FULLFSYNC"
-        except OSError:
-            pass
-
-    os.fsync(fd)
+    os.fsync(file_obj.fileno())
     return "fsync"
 
 
-def _sequential_test_portable(test_file: str, data_chunk: bytes, file_size_mb: int) -> dict:
-    uncached_modes = set()
-    sync_mode = "none"
-
+def _run_sequential_drive_test(test_file: str, data_chunk: bytes, file_size_mb: int) -> dict:
     start_time = time.perf_counter()
     with open(test_file, 'wb', buffering=0) as f:
-        uncached_modes.update(_enable_uncached_io(f))
         for _ in range(file_size_mb):
             f.write(data_chunk)
         sync_mode = _sync_file_to_storage(f)
-        _drop_file_cache(f)
     write_time = time.perf_counter() - start_time
 
     start_time = time.perf_counter()
     with open(test_file, 'rb', buffering=0) as f:
-        uncached_modes.update(_enable_uncached_io(f))
         while f.read(DRIVE_BLOCK_BYTES):
             pass
-        _drop_file_cache(f)
     read_time = time.perf_counter() - start_time
 
     return {
         "write_time": write_time,
         "read_time": read_time,
-        "cache_modes": sorted(uncached_modes),
+        "io_mode": "standard file I/O",
         "sync_mode": sync_mode,
     }
-
-
-def _sequential_test_windows(test_file: str, data_chunk: bytes, file_size_mb: int) -> Optional[dict]:
-    if sys.platform != "win32":
-        return None
-
-    import ctypes
-    from ctypes import wintypes
-
-    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
-
-    GENERIC_READ = 0x80000000
-    GENERIC_WRITE = 0x40000000
-    FILE_SHARE_READ = 0x00000001
-    FILE_SHARE_WRITE = 0x00000002
-    FILE_SHARE_DELETE = 0x00000004
-    CREATE_ALWAYS = 2
-    OPEN_EXISTING = 3
-    FILE_ATTRIBUTE_NORMAL = 0x00000080
-    FILE_FLAG_SEQUENTIAL_SCAN = 0x08000000
-    FILE_FLAG_NO_BUFFERING = 0x20000000
-    FILE_FLAG_WRITE_THROUGH = 0x80000000
-    MEM_COMMIT = 0x00001000
-    MEM_RESERVE = 0x00002000
-    MEM_RELEASE = 0x00008000
-    PAGE_READWRITE = 0x04
-    INVALID_HANDLE_VALUE = ctypes.c_void_p(-1).value
-
-    kernel32.CreateFileW.argtypes = [
-        wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD, wintypes.LPVOID,
-        wintypes.DWORD, wintypes.DWORD, wintypes.HANDLE,
-    ]
-    kernel32.CreateFileW.restype = wintypes.HANDLE
-    kernel32.ReadFile.argtypes = [
-        wintypes.HANDLE, wintypes.LPVOID, wintypes.DWORD,
-        ctypes.POINTER(wintypes.DWORD), wintypes.LPVOID,
-    ]
-    kernel32.ReadFile.restype = wintypes.BOOL
-    kernel32.WriteFile.argtypes = [
-        wintypes.HANDLE, wintypes.LPVOID, wintypes.DWORD,
-        ctypes.POINTER(wintypes.DWORD), wintypes.LPVOID,
-    ]
-    kernel32.WriteFile.restype = wintypes.BOOL
-    kernel32.FlushFileBuffers.argtypes = [wintypes.HANDLE]
-    kernel32.FlushFileBuffers.restype = wintypes.BOOL
-    kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
-    kernel32.CloseHandle.restype = wintypes.BOOL
-    kernel32.VirtualAlloc.argtypes = [wintypes.LPVOID, ctypes.c_size_t, wintypes.DWORD, wintypes.DWORD]
-    kernel32.VirtualAlloc.restype = wintypes.LPVOID
-    kernel32.VirtualFree.argtypes = [wintypes.LPVOID, ctypes.c_size_t, wintypes.DWORD]
-    kernel32.VirtualFree.restype = wintypes.BOOL
-
-    flags = FILE_ATTRIBUTE_NORMAL | FILE_FLAG_SEQUENTIAL_SCAN | FILE_FLAG_NO_BUFFERING | FILE_FLAG_WRITE_THROUGH
-    share = FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE
-    buffer_ptr = kernel32.VirtualAlloc(None, DRIVE_BLOCK_BYTES, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE)
-    if not buffer_ptr:
-        return None
-
-    ctypes.memmove(buffer_ptr, data_chunk, DRIVE_BLOCK_BYTES)
-
-    def close_handle(handle):
-        if handle and handle != INVALID_HANDLE_VALUE:
-            kernel32.CloseHandle(handle)
-
-    try:
-        written = wintypes.DWORD()
-        start_time = time.perf_counter()
-        handle = kernel32.CreateFileW(test_file, GENERIC_WRITE, share, None, CREATE_ALWAYS, flags, None)
-        if handle == INVALID_HANDLE_VALUE:
-            return None
-        try:
-            for _ in range(file_size_mb):
-                if not kernel32.WriteFile(handle, buffer_ptr, DRIVE_BLOCK_BYTES, ctypes.byref(written), None):
-                    return None
-                if written.value != DRIVE_BLOCK_BYTES:
-                    return None
-            if not kernel32.FlushFileBuffers(handle):
-                return None
-        finally:
-            close_handle(handle)
-        write_time = time.perf_counter() - start_time
-
-        read = wintypes.DWORD()
-        start_time = time.perf_counter()
-        handle = kernel32.CreateFileW(test_file, GENERIC_READ, share, None, OPEN_EXISTING, flags, None)
-        if handle == INVALID_HANDLE_VALUE:
-            return None
-        try:
-            while True:
-                if not kernel32.ReadFile(handle, buffer_ptr, DRIVE_BLOCK_BYTES, ctypes.byref(read), None):
-                    return None
-                if read.value == 0:
-                    break
-        finally:
-            close_handle(handle)
-        read_time = time.perf_counter() - start_time
-    finally:
-        kernel32.VirtualFree(buffer_ptr, 0, MEM_RELEASE)
-
-    return {
-        "write_time": write_time,
-        "read_time": read_time,
-        "cache_modes": ["FILE_FLAG_NO_BUFFERING", "FILE_FLAG_SEQUENTIAL_SCAN"],
-        "sync_mode": "FILE_FLAG_WRITE_THROUGH + FlushFileBuffers",
-    }
-
-
-def _run_sequential_drive_test(test_file: str, data_chunk: bytes, file_size_mb: int) -> dict:
-    if sys.platform == "win32":
-        windows_result = _sequential_test_windows(test_file, data_chunk, file_size_mb)
-        if windows_result is not None:
-            return windows_result
-
-    return _sequential_test_portable(test_file, data_chunk, file_size_mb)
 
 
 def _cpu_burn_worker(
@@ -499,15 +331,15 @@ class PerformanceTest:
             'read_speed_mb_s': read_speed,
             'file_size_mb': file_size_mb,
             'sync_mode': result["sync_mode"],
-            'uncached_modes': result["cache_modes"]
+            'io_mode': result["io_mode"],
+            'read_note': "filesystem cache may affect this value"
         }
         
-        cache_note = ", ".join(result["cache_modes"]) if result["cache_modes"] else "best-effort"
         print(f"   Test File Size: {file_size_mb} MB")
-        print(f"   Cache Mode: {cache_note}")
+        print(f"   I/O Mode: {result['io_mode']}")
         print(f"   Write Flush: {result['sync_mode']}")
         print(f"   Sequential Write: {write_speed:.1f} MB/s")
-        print(f"   Sequential Read: {read_speed:.1f} MB/s")
+        print(f"   Sequential Read: {read_speed:.1f} MB/s (cache-sensitive)")
     
     def drive_random_test(self, num_operations=1000):
         """Test random read/write performance"""
@@ -557,23 +389,8 @@ class PerformanceTest:
             'operations': num_operations
         }
         
-        print(f"   Random Read: {read_iops:.0f} IOPS")
+        print(f"   Random Read: {read_iops:.0f} IOPS (cache-sensitive)")
         print(f"   Random Write: {write_iops:.0f} IOPS")
-    
-    def calculate_drive_score(self):
-        """Calculate overall drive performance score as composite metric"""
-        seq = self.results['sequential']
-        rand = self.results['random']
-        
-        # Create a composite score that combines all metrics
-        # Sequential throughput (MB/s) + Random IOPS weighted
-        # This gives a single number that represents overall drive performance
-        drive_score = int(
-            (seq['write_speed_mb_s'] + seq['read_speed_mb_s']) / 2 +
-            (rand['read_iops'] + rand['write_iops']) / 100
-        )
-        
-        return drive_score
     
     def run_all_tests(
         self,
@@ -614,12 +431,7 @@ class PerformanceTest:
             
             # Calculate scores
             cpu_score = self.results['cpu']['score']
-            if not skip_drive:
-                drive_score = self.calculate_drive_score()
-                overall_score = int((cpu_score + drive_score) / 2)
-            else:
-                drive_score = None
-                overall_score = cpu_score
+            overall_score = cpu_score
             
             # Detailed breakdown
             print("📋 DETAILED BREAKDOWN")
@@ -638,11 +450,11 @@ class PerformanceTest:
             if not skip_drive:
                 print(f"Drive Tests:")
                 print(f"  • Sequential Test Size: {seq['file_size_mb']} MB")
-                print(f"  • Cache Mode: {', '.join(seq['uncached_modes']) if seq['uncached_modes'] else 'best-effort'}")
+                print(f"  • I/O Mode: {seq['io_mode']}")
                 print(f"  • Write Flush: {seq['sync_mode']}")
                 print(f"  • Sequential Write: {seq['write_speed_mb_s']:.1f} MB/s")
-                print(f"  • Sequential Read: {seq['read_speed_mb_s']:.1f} MB/s")
-                print(f"  • Random Read: {rand['read_iops']:.0f} IOPS")
+                print(f"  • Sequential Read: {seq['read_speed_mb_s']:.1f} MB/s (cache-sensitive)")
+                print(f"  • Random Read: {rand['read_iops']:.0f} IOPS (cache-sensitive)")
                 print(f"  • Random Write: {rand['write_iops']:.0f} IOPS")
                 print()
             
@@ -651,8 +463,8 @@ class PerformanceTest:
             print("=" * 50)
             print(f"CPU Performance Score:    {cpu_score:8d} {cpu['unit_label']}")
             if not skip_drive:
-                print(f"Drive Performance Score:  {drive_score:8d} composite")
-                print(f"Overall Performance Score: {overall_score:8d} combined")
+                print("Drive Performance Score:  not reported (cache-sensitive)")
+                print(f"Overall Performance Score: {overall_score:8d} (CPU only)")
             else:
                 print(f"Overall Performance Score: {overall_score:8d} (CPU only)")
             

@@ -86,6 +86,149 @@ def _sync_file_to_storage(file_obj) -> str:
     return "fsync"
 
 
+def _sequential_test_portable(test_file: str, data_chunk: bytes, file_size_mb: int) -> dict:
+    uncached_modes = set()
+    sync_mode = "none"
+
+    start_time = time.perf_counter()
+    with open(test_file, 'wb', buffering=0) as f:
+        uncached_modes.update(_enable_uncached_io(f))
+        for _ in range(file_size_mb):
+            f.write(data_chunk)
+        sync_mode = _sync_file_to_storage(f)
+        _drop_file_cache(f)
+    write_time = time.perf_counter() - start_time
+
+    start_time = time.perf_counter()
+    with open(test_file, 'rb', buffering=0) as f:
+        uncached_modes.update(_enable_uncached_io(f))
+        while f.read(DRIVE_BLOCK_BYTES):
+            pass
+        _drop_file_cache(f)
+    read_time = time.perf_counter() - start_time
+
+    return {
+        "write_time": write_time,
+        "read_time": read_time,
+        "cache_modes": sorted(uncached_modes),
+        "sync_mode": sync_mode,
+    }
+
+
+def _sequential_test_windows(test_file: str, data_chunk: bytes, file_size_mb: int) -> Optional[dict]:
+    if sys.platform != "win32":
+        return None
+
+    import ctypes
+    from ctypes import wintypes
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+
+    GENERIC_READ = 0x80000000
+    GENERIC_WRITE = 0x40000000
+    FILE_SHARE_READ = 0x00000001
+    FILE_SHARE_WRITE = 0x00000002
+    FILE_SHARE_DELETE = 0x00000004
+    CREATE_ALWAYS = 2
+    OPEN_EXISTING = 3
+    FILE_ATTRIBUTE_NORMAL = 0x00000080
+    FILE_FLAG_SEQUENTIAL_SCAN = 0x08000000
+    FILE_FLAG_NO_BUFFERING = 0x20000000
+    FILE_FLAG_WRITE_THROUGH = 0x80000000
+    MEM_COMMIT = 0x00001000
+    MEM_RESERVE = 0x00002000
+    MEM_RELEASE = 0x00008000
+    PAGE_READWRITE = 0x04
+    INVALID_HANDLE_VALUE = ctypes.c_void_p(-1).value
+
+    kernel32.CreateFileW.argtypes = [
+        wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD, wintypes.LPVOID,
+        wintypes.DWORD, wintypes.DWORD, wintypes.HANDLE,
+    ]
+    kernel32.CreateFileW.restype = wintypes.HANDLE
+    kernel32.ReadFile.argtypes = [
+        wintypes.HANDLE, wintypes.LPVOID, wintypes.DWORD,
+        ctypes.POINTER(wintypes.DWORD), wintypes.LPVOID,
+    ]
+    kernel32.ReadFile.restype = wintypes.BOOL
+    kernel32.WriteFile.argtypes = [
+        wintypes.HANDLE, wintypes.LPVOID, wintypes.DWORD,
+        ctypes.POINTER(wintypes.DWORD), wintypes.LPVOID,
+    ]
+    kernel32.WriteFile.restype = wintypes.BOOL
+    kernel32.FlushFileBuffers.argtypes = [wintypes.HANDLE]
+    kernel32.FlushFileBuffers.restype = wintypes.BOOL
+    kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+    kernel32.CloseHandle.restype = wintypes.BOOL
+    kernel32.VirtualAlloc.argtypes = [wintypes.LPVOID, ctypes.c_size_t, wintypes.DWORD, wintypes.DWORD]
+    kernel32.VirtualAlloc.restype = wintypes.LPVOID
+    kernel32.VirtualFree.argtypes = [wintypes.LPVOID, ctypes.c_size_t, wintypes.DWORD]
+    kernel32.VirtualFree.restype = wintypes.BOOL
+
+    flags = FILE_ATTRIBUTE_NORMAL | FILE_FLAG_SEQUENTIAL_SCAN | FILE_FLAG_NO_BUFFERING | FILE_FLAG_WRITE_THROUGH
+    share = FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE
+    buffer_ptr = kernel32.VirtualAlloc(None, DRIVE_BLOCK_BYTES, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE)
+    if not buffer_ptr:
+        return None
+
+    ctypes.memmove(buffer_ptr, data_chunk, DRIVE_BLOCK_BYTES)
+
+    def close_handle(handle):
+        if handle and handle != INVALID_HANDLE_VALUE:
+            kernel32.CloseHandle(handle)
+
+    try:
+        written = wintypes.DWORD()
+        start_time = time.perf_counter()
+        handle = kernel32.CreateFileW(test_file, GENERIC_WRITE, share, None, CREATE_ALWAYS, flags, None)
+        if handle == INVALID_HANDLE_VALUE:
+            return None
+        try:
+            for _ in range(file_size_mb):
+                if not kernel32.WriteFile(handle, buffer_ptr, DRIVE_BLOCK_BYTES, ctypes.byref(written), None):
+                    return None
+                if written.value != DRIVE_BLOCK_BYTES:
+                    return None
+            if not kernel32.FlushFileBuffers(handle):
+                return None
+        finally:
+            close_handle(handle)
+        write_time = time.perf_counter() - start_time
+
+        read = wintypes.DWORD()
+        start_time = time.perf_counter()
+        handle = kernel32.CreateFileW(test_file, GENERIC_READ, share, None, OPEN_EXISTING, flags, None)
+        if handle == INVALID_HANDLE_VALUE:
+            return None
+        try:
+            while True:
+                if not kernel32.ReadFile(handle, buffer_ptr, DRIVE_BLOCK_BYTES, ctypes.byref(read), None):
+                    return None
+                if read.value == 0:
+                    break
+        finally:
+            close_handle(handle)
+        read_time = time.perf_counter() - start_time
+    finally:
+        kernel32.VirtualFree(buffer_ptr, 0, MEM_RELEASE)
+
+    return {
+        "write_time": write_time,
+        "read_time": read_time,
+        "cache_modes": ["FILE_FLAG_NO_BUFFERING", "FILE_FLAG_SEQUENTIAL_SCAN"],
+        "sync_mode": "FILE_FLAG_WRITE_THROUGH + FlushFileBuffers",
+    }
+
+
+def _run_sequential_drive_test(test_file: str, data_chunk: bytes, file_size_mb: int) -> dict:
+    if sys.platform == "win32":
+        windows_result = _sequential_test_windows(test_file, data_chunk, file_size_mb)
+        if windows_result is not None:
+            return windows_result
+
+    return _sequential_test_portable(test_file, data_chunk, file_size_mb)
+
+
 def _cpu_burn_worker(
     duration: float,
     num_slices: int = 10,
@@ -340,29 +483,11 @@ class PerformanceTest:
         
         test_file = os.path.join(self.temp_dir, "sequential_test.dat")
         data_chunk = _make_drive_chunk()
-        uncached_modes = set()
-        sync_mode = "none"
-        
-        # Sequential Write Test
-        start_time = time.perf_counter()
-        with open(test_file, 'wb', buffering=0) as f:
-            uncached_modes.update(_enable_uncached_io(f))
-            for _ in range(file_size_mb):
-                f.write(data_chunk)
-            sync_mode = _sync_file_to_storage(f)
-            _drop_file_cache(f)
-        write_time = time.perf_counter() - start_time
-        write_speed = file_size_mb / write_time  # MB/s
-        
-        # Sequential Read Test
-        start_time = time.perf_counter()
-        with open(test_file, 'rb', buffering=0) as f:
-            uncached_modes.update(_enable_uncached_io(f))
-            while f.read(DRIVE_BLOCK_BYTES):
-                pass
-            _drop_file_cache(f)
-        read_time = time.perf_counter() - start_time
+        result = _run_sequential_drive_test(test_file, data_chunk, file_size_mb)
+        write_time = result["write_time"]
+        read_time = result["read_time"]
         read_speed = file_size_mb / read_time  # MB/s
+        write_speed = file_size_mb / write_time  # MB/s
         
         # Clean up
         os.remove(test_file)
@@ -373,14 +498,14 @@ class PerformanceTest:
             'write_speed_mb_s': write_speed,
             'read_speed_mb_s': read_speed,
             'file_size_mb': file_size_mb,
-            'sync_mode': sync_mode,
-            'uncached_modes': sorted(uncached_modes)
+            'sync_mode': result["sync_mode"],
+            'uncached_modes': result["cache_modes"]
         }
         
-        cache_note = ", ".join(sorted(uncached_modes)) if uncached_modes else "best-effort"
+        cache_note = ", ".join(result["cache_modes"]) if result["cache_modes"] else "best-effort"
         print(f"   Test File Size: {file_size_mb} MB")
         print(f"   Cache Mode: {cache_note}")
-        print(f"   Write Flush: {sync_mode}")
+        print(f"   Write Flush: {result['sync_mode']}")
         print(f"   Sequential Write: {write_speed:.1f} MB/s")
         print(f"   Sequential Read: {read_speed:.1f} MB/s")
     

@@ -53,7 +53,14 @@ The CPU score is reported as `SHA-256 MiB/sec`. It means how many 1 MiB chunks t
 
 ## Interpreting Drive Results
 
-The sequential drive test uses a 1 GiB test file by default, writes deterministic non-compressible data, requests uncached file I/O where the OS supports it, and flushes writes before reporting write throughput. On macOS it uses `F_NOCACHE` and `F_FULLFSYNC`; on platforms with `posix_fadvise`, it also uses sequential and cache-drop hints.
+The sequential drive test uses a 1 GiB test file by default, writes deterministic non-compressible data, requests uncached or cache-minimizing file I/O where the OS supports it, and flushes writes before reporting write throughput.
+
+Platform behavior:
+- macOS: uses `F_NOCACHE` and `F_FULLFSYNC`.
+- Windows: uses `CreateFileW` with `FILE_FLAG_NO_BUFFERING`, `FILE_FLAG_WRITE_THROUGH`, `FILE_FLAG_SEQUENTIAL_SCAN`, and `FlushFileBuffers`.
+- Linux/POSIX: uses unbuffered Python file handles, `fsync`, and `posix_fadvise` sequential/cache-drop hints where available.
+
+The output prints the cache and flush mode used for the run. If a platform rejects the strongest mode, the tool falls back to the portable path and labels the mode accordingly.
 
 Use `--drive-size-mb` for a faster smoke run. Smaller files run faster but are more likely to be affected by cache and filesystem behavior.
 
